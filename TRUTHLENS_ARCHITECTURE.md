@@ -40,17 +40,18 @@ The Nemotron 3 family gives us the right model for each analysis tier.
 
 ### Models we use
 
-| Model | Params | Active | Context | Use in TruthLens | Where |
-|---|---|---|---|---|---|
-| **Nemotron 3 Nano** | 30B | 3B | 32K | L1 Pulse — fast structured output, <1s | Nebius Token Factory |
-| **Nemotron 3 Super** | 120B | 12B | 1M | L2 Analysis + L3 Patterns — deep reasoning, tool calling | Nebius Token Factory |
+| Model | Params | Use in TruthLens | Where |
+|---|---|---|---|
+| **Nemotron Speech ASR** | 0.6B | Voice → text transcription, sub-100ms streaming latency | NIM Cloud (build.nvidia.com) |
+| **Nemotron 3 Nano** | 30B (3B active) | L1 Pulse — fast structured output, <1s | Nebius Token Factory |
+| **Nemotron 3 Super** | 120B (12B active) | L2 Analysis + L3 Patterns — deep reasoning, 1M context | Nebius Token Factory |
 
-**Why two models instead of one:**
-- L1 needs speed above all else. Nano at 3B active params gives sub-second
-  `generateObject` calls. At $0.06/1M input tokens, it's essentially free.
-- L2/L3 need reasoning depth and the 1M context window. Super is a reasoning
-  model (think budget controllable) that matches GPT-5.4 on voice agent
-  benchmarks. It handles tool calling for Tavily verification.
+**The all-Nemotron pitch:**
+Three Nemotron models, three analysis tiers, one ecosystem.
+- ASR (0.6B) converts voice to text in real time
+- Nano (3B active) flags claims in under a second
+- Super (12B active) reasons deeply with 1M tokens of context
+- All open weights, all NVIDIA, all running concurrently
 
 ### Models to be aware of (announced GTC 2026)
 
@@ -63,24 +64,32 @@ The Nemotron 3 family gives us the right model for each analysis tier.
 
 ### Voice input strategy
 
-For the hackathon MVP, **Web Speech API** is the fastest path -- zero config,
-zero cost, works in Chrome. But for the demo pitch, we should mention the
-NVIDIA-native path:
+**Primary: NIM ASR (all-Nemotron stack)**
 
 ```
-MVP (hackathon):     Browser mic → Web Speech API → text chunks → Convex
-Production path:     Browser mic → MediaRecorder → audio chunks → Convex action
-                       → Nemotron ASR Streaming (NIM) → text → analysis pipeline
-Dream path (future): Browser mic → audio → Nemotron 3 Omni → claim analysis
-                       directly from audio (no separate ASR)
+Browser mic → getUserMedia → MediaRecorder (10s WebM/Opus chunks)
+    → POST audio blob to /api/transcribe (thin Next.js proxy)
+    → NIM Cloud ASR (grpc.nvcf.nvidia.com:443)
+    → text chunk returned to browser
+    → addChunk() Convex mutation → L1/L2/L3
 ```
 
-The production path would use `MediaRecorder` to capture audio chunks, send them
-to a Convex HTTP action, which forwards to a Nemotron ASR NIM endpoint for
-transcription, then feeds the text into the same `addChunk` pipeline. Same
-backend, better transcription, fully NVIDIA stack.
+This is the one place we keep a Next.js API route -- binary audio blobs
+are awkward to pass through Convex mutations. The route is a thin proxy:
+receive audio, forward to NIM, return text. All analysis stays in Convex.
 
-### Nebius API wiring
+**Fallback: Web Speech API**
+
+If the NIM endpoint is unavailable or the user doesn't have an NVIDIA API key,
+the hook falls back to the browser's `SpeechRecognition` API. Same `addChunk`
+mutation, same pipeline.
+
+```
+Fallback:            Browser mic → Web Speech API → text chunks → addChunk()
+Future (announced):  Browser mic → audio → Nemotron 3 Omni → direct analysis
+```
+
+### Provider Configuration
 
 ```typescript
 // convex/analysis.ts
@@ -88,10 +97,9 @@ import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 
 const nebius = createOpenAICompatible({
   name: "nebius",
+  apiKey: process.env.NEBIUS_API_KEY,
   baseURL: "https://api.tokenfactory.nebius.com/v1/",
-  headers: {
-    Authorization: `Bearer ${process.env.NEBIUS_API_KEY}`,
-  },
+  supportsStructuredOutputs: true,
 });
 
 // L1: Nano for speed
@@ -104,6 +112,16 @@ const superModel = nebius.chatModel(
   "nvidia/nemotron-3-super-120b-a12b"
 );
 ```
+
+**Critical config notes:**
+
+- **`apiKey`** -- use this instead of manually setting `Authorization` headers.
+  The provider auto-adds `Bearer <key>`. Set the key in the Convex dashboard,
+  not in `.env` files (Convex actions run on Convex Cloud, not your machine).
+- **`supportsStructuredOutputs: true`** -- tells the AI SDK that Nebius supports
+  native `json_schema` response format. Without this, the SDK falls back to
+  tool-based extraction which is slower and less reliable with Nemotron models.
+- **`baseURL` trailing slash** -- Nebius requires it: `https://api.tokenfactory.nebius.com/v1/`
 
 ### Why Convex
 
@@ -205,8 +223,8 @@ const superModel = nebius.chatModel(
 
 ## Voice Input (Live Demo Mode)
 
-The live demo mode uses the browser's built-in **Web Speech API** -- zero API
-keys, zero dependencies. Chrome and Edge have the best support.
+Primary voice mode uses **Nemotron Speech ASR** via NIM Cloud for server-side
+transcription. Falls back to the browser's Web Speech API if NIM is unavailable.
 
 ### How it works
 
@@ -214,23 +232,73 @@ keys, zero dependencies. Chrome and Edge have the best support.
 User speaks
     │
     ▼
-SpeechRecognition (continuous: true, interimResults: true)
+getUserMedia({ audio: true })
     │
-    ├── interim results ──▶ render in transcript area immediately (local state)
-    │                       gives user real-time feedback as they speak
+    ▼
+MediaRecorder (timeslice: 10000ms, WebM/Opus)
     │
-    └── final results ────▶ accumulate in chunk buffer (React ref)
-                            │
-                            ├── 15-second timer fires OR buffer hits ~80 words
-                            │
-                            ▼
-                    flush buffer → addChunk({ sessionId, text })
-                            │
-                            ▼
-                    L1 fires immediately (< 1s)
-                    L2 fires every 3rd chunk
-                    L3 fires after 6+ chunks
+    ├── ondataavailable every ~10s ──▶ audio blob
+    │                                      │
+    │                                POST /api/transcribe
+    │                                      │
+    │                               NIM Cloud ASR (gRPC)
+    │                                      │
+    │                               text chunk returned
+    │                                      │
+    │                          addChunk({ sessionId, text })
+    │                                      │
+    │                               L1 fires immediately
+    │                               L2 every 3rd chunk
+    │                               L3 after 6+ chunks
+    │
+    └── (during wait) ──▶ show recording indicator / waveform
 ```
+
+Voice segments ARE the text chunks. Each ~10 second audio blob becomes one
+text chunk. No `splitIntoChunks` needed -- the MediaRecorder timeslice creates
+the chunking naturally.
+
+### NIM ASR Cloud Integration
+
+The transcription route is the one Next.js API route in the stack. It proxies
+audio blobs to NVIDIA's NIM Cloud ASR endpoint via gRPC.
+
+```typescript
+// app/api/transcribe/route.ts
+// Thin proxy: receive audio blob, forward to NIM ASR, return text.
+// This stays as a Next.js route because binary audio is awkward in Convex
+// mutations. All analysis logic remains in Convex.
+
+import { credentials } from "@grpc/grpc-js";
+import { loadSync } from "@grpc/proto-loader";
+
+export async function POST(request: Request) {
+  const formData = await request.formData();
+  const audioFile = formData.get("audio") as File;
+  const audioBuffer = Buffer.from(await audioFile.arrayBuffer());
+
+  const text = await transcribeWithNIM(audioBuffer);
+
+  return Response.json({ text });
+}
+
+async function transcribeWithNIM(audioBuffer: Buffer): Promise<string> {
+  // gRPC call to NIM Cloud ASR at grpc.nvcf.nvidia.com:443
+  // Uses Riva ASR proto definitions
+  // Auth: Bearer ${NVIDIA_API_KEY} in gRPC metadata
+  // Returns transcribed text with punctuation + capitalization
+  // ...
+}
+```
+
+**NIM Cloud ASR details:**
+- Endpoint: `grpc.nvcf.nvidia.com:443`
+- Auth: `Bearer ${NVIDIA_API_KEY}` in gRPC metadata
+- Model: Nemotron Speech ASR Streaming (0.6B)
+- Input: 16kHz audio (WebM/Opus from MediaRecorder)
+- Output: text with punctuation and capitalization
+- Latency: sub-100ms per chunk
+- Requires: `@grpc/grpc-js`, `@grpc/proto-loader`, Riva proto files
 
 ### Voice hook (app/hooks/useVoiceInput.ts)
 
@@ -242,89 +310,126 @@ import { useRef, useState, useCallback, useEffect } from "react";
 
 interface UseVoiceInputOptions {
   onChunkReady: (text: string) => void;
+  useNimAsr?: boolean;
   chunkIntervalMs?: number;
-  maxWordsPerChunk?: number;
 }
 
 export function useVoiceInput({
   onChunkReady,
-  chunkIntervalMs = 15_000,
-  maxWordsPerChunk = 80,
+  useNimAsr = true,
+  chunkIntervalMs = 10_000,
 }: UseVoiceInputOptions) {
   const [isListening, setIsListening] = useState(false);
-  const [interimText, setInterimText] = useState("");
   const [fullTranscript, setFullTranscript] = useState("");
-  const bufferRef = useRef("");
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval>>();
 
-  const flush = useCallback(() => {
-    const text = bufferRef.current.trim();
-    if (text.length === 0) return;
-    onChunkReady(text);
-    setFullTranscript((prev) => prev + (prev ? "\n\n" : "") + text);
-    bufferRef.current = "";
-  }, [onChunkReady]);
+  // ── Primary: MediaRecorder → NIM ASR ────────────────────
+  const startNimAsr = useCallback(async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const recorder = new MediaRecorder(stream, {
+      mimeType: "audio/webm;codecs=opus",
+    });
 
-  const start = useCallback(() => {
+    recorder.ondataavailable = async (event) => {
+      if (event.data.size === 0) return;
+      setIsTranscribing(true);
+
+      const formData = new FormData();
+      formData.append("audio", event.data, "chunk.webm");
+
+      try {
+        const res = await fetch("/api/transcribe", {
+          method: "POST",
+          body: formData,
+        });
+        const { text } = await res.json();
+        if (text?.trim()) {
+          onChunkReady(text.trim());
+          setFullTranscript((prev) =>
+            prev + (prev ? "\n\n" : "") + text.trim()
+          );
+        }
+      } finally {
+        setIsTranscribing(false);
+      }
+    };
+
+    recorder.start(chunkIntervalMs);
+    mediaRecorderRef.current = recorder;
+    setIsListening(true);
+  }, [onChunkReady, chunkIntervalMs]);
+
+  // ── Fallback: Web Speech API ────────────────────────────
+  const startWebSpeech = useCallback(() => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) return;
 
     const recognition = new SR();
     recognition.continuous = true;
-    recognition.interimResults = true;
+    recognition.interimResults = false;
     recognition.lang = "en-US";
 
+    let buffer = "";
     recognition.onresult = (event) => {
-      let interim = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
         if (event.results[i].isFinal) {
-          bufferRef.current += transcript + " ";
-          // Auto-flush if word count exceeded
-          if (bufferRef.current.split(/\s+/).length >= maxWordsPerChunk) {
-            flush();
-          }
-        } else {
-          interim += transcript;
+          buffer += event.results[i][0].transcript + " ";
         }
       }
-      setInterimText(interim);
     };
 
-    // Chrome cuts off after ~60s; auto-restart
-    recognition.onend = () => {
-      if (recognitionRef.current) {
-        recognition.start();
+    // Flush buffer periodically
+    const timer = setInterval(() => {
+      if (buffer.trim()) {
+        onChunkReady(buffer.trim());
+        setFullTranscript((prev) =>
+          prev + (prev ? "\n\n" : "") + buffer.trim()
+        );
+        buffer = "";
       }
+    }, chunkIntervalMs);
+
+    recognition.onend = () => {
+      if (recognitionRef.current) recognition.start();
     };
 
     recognition.start();
     recognitionRef.current = recognition;
     setIsListening(true);
 
-    // Periodic flush timer
-    timerRef.current = setInterval(flush, chunkIntervalMs);
-  }, [flush, chunkIntervalMs, maxWordsPerChunk]);
+    return () => clearInterval(timer);
+  }, [onChunkReady, chunkIntervalMs]);
+
+  const start = useCallback(async () => {
+    if (useNimAsr) {
+      await startNimAsr();
+    } else {
+      startWebSpeech();
+    }
+  }, [useNimAsr, startNimAsr, startWebSpeech]);
 
   const stop = useCallback(() => {
-    recognitionRef.current?.stop();
-    recognitionRef.current = null;
-    clearInterval(timerRef.current);
-    flush(); // flush remaining buffer
-    setIsListening(false);
-    setInterimText("");
-  }, [flush]);
-
-  useEffect(() => {
-    return () => {
-      recognitionRef.current?.stop();
+    if (mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream
+        .getTracks()
+        .forEach((t) => t.stop());
+      mediaRecorderRef.current = null;
+    }
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
       recognitionRef.current = null;
-      clearInterval(timerRef.current);
-    };
+    }
+    setIsListening(false);
   }, []);
 
-  return { isListening, interimText, fullTranscript, start, stop };
+  useEffect(() => {
+    return () => { stop(); };
+  }, [stop]);
+
+  return { isListening, isTranscribing, fullTranscript, start, stop };
 }
 ```
 
@@ -334,23 +439,24 @@ export function useVoiceInput({
 // In TranscriptInput.tsx
 const addChunk = useMutation(api.chunks.addChunk);
 
-const { isListening, interimText, fullTranscript, start, stop } =
+const { isListening, isTranscribing, fullTranscript, start, stop } =
   useVoiceInput({
+    useNimAsr: true, // set false to fallback to Web Speech API
     onChunkReady: (text) => {
       addChunk({ sessionId, text });
     },
   });
 ```
 
-One function call. The user speaks, the buffer flushes, `addChunk` fires, L1
-runs, results appear -- all reactive, no polling.
+Each 10-second audio blob becomes one text chunk. `addChunk` fires, L1 runs,
+results appear -- all reactive, no polling.
 
 ### Two input modes
 
 | Mode | Source | Chunking | Use case |
 |---|---|---|---|
 | **Paste** | User pastes full text | Split into ~200-word segments client-side | Analyzing articles, transcripts |
-| **Live Mic** | Web Speech API | Time-based (15s) + word-count (80w) | Live talks, pitches, podcasts |
+| **Live Mic** | MediaRecorder → NIM ASR (or Web Speech API fallback) | 10s audio chunks → text | Live talks, pitches, podcasts |
 
 Both modes feed the same `addChunk` mutation. The backend doesn't know or care
 which input mode produced the chunk.
@@ -444,16 +550,16 @@ export default defineSchema({
 
 ## Convex Functions
 
-### Mutations (convex/sessions.ts)
+### Mutations + Queries (convex/sessions.ts)
 
 ```typescript
-// convex/sessions.ts
+// convex/sessions.ts — NO "use node" (queries + mutations only)
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import { internal } from "./_generated/api";
 
 export const create = mutation({
   args: {},
+  returns: v.id("sessions"),
   handler: async (ctx) => {
     return await ctx.db.insert("sessions", {
       chunkCount: 0,
@@ -465,16 +571,27 @@ export const create = mutation({
 
 export const get = query({
   args: { sessionId: v.id("sessions") },
+  returns: v.union(
+    v.object({
+      _id: v.id("sessions"),
+      _creationTime: v.number(),
+      title: v.optional(v.string()),
+      chunkCount: v.number(),
+      status: v.union(v.literal("active"), v.literal("complete")),
+      createdAt: v.number(),
+    }),
+    v.null()
+  ),
   handler: async (ctx, args) => {
     return await ctx.db.get(args.sessionId);
   },
 });
 ```
 
-### Mutations (convex/chunks.ts)
+### Mutations + Queries (convex/chunks.ts)
 
 ```typescript
-// convex/chunks.ts
+// convex/chunks.ts — NO "use node" (queries + mutations only)
 import { v } from "convex/values";
 import { mutation, query } from "./_generated/server";
 import { internal } from "./_generated/api";
@@ -484,6 +601,7 @@ export const addChunk = mutation({
     sessionId: v.id("sessions"),
     text: v.string(),
   },
+  returns: v.id("chunks"),
   handler: async (ctx, args) => {
     const session = await ctx.db.get(args.sessionId);
     if (!session) throw new Error("Session not found");
@@ -531,6 +649,14 @@ export const addChunk = mutation({
 
 export const listBySession = query({
   args: { sessionId: v.id("sessions") },
+  returns: v.array(v.object({
+    _id: v.id("chunks"),
+    _creationTime: v.number(),
+    sessionId: v.id("sessions"),
+    index: v.number(),
+    text: v.string(),
+    createdAt: v.number(),
+  })),
   handler: async (ctx, args) => {
     return await ctx.db
       .query("chunks")
@@ -540,7 +666,7 @@ export const listBySession = query({
 });
 ```
 
-### Actions (convex/analysis.ts)
+### Actions (convex/analysis.ts) — `"use node"` file, actions ONLY
 
 ```typescript
 // convex/analysis.ts
@@ -549,22 +675,22 @@ export const listBySession = query({
 import { v } from "convex/values";
 import { internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
-import { generateObject } from "ai";
+import { generateText, Output } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { z } from "zod";
 
+// ── Provider setup ────────────────────────────────────────
+// apiKey auto-adds Authorization: Bearer header.
+// supportsStructuredOutputs tells the SDK to use Nebius's native
+// json_schema response_format instead of tool-based fallback.
 const nebius = createOpenAICompatible({
   name: "nebius",
+  apiKey: process.env.NEBIUS_API_KEY,
   baseURL: "https://api.tokenfactory.nebius.com/v1/",
-  headers: {
-    Authorization: `Bearer ${process.env.NEBIUS_API_KEY}`,
-  },
+  supportsStructuredOutputs: true,
 });
 
-// Nano for L1: 3B active params, sub-second structured output
 const nanoModel = nebius.chatModel("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B");
-
-// Super for L2 + L3: reasoning depth, tool calling, 1M context
 const superModel = nebius.chatModel("nvidia/nemotron-3-super-120b-a12b");
 
 // ── L1 Pulse ──────────────────────────────────────────────
@@ -576,31 +702,35 @@ export const runPulse = internalAction({
     text: v.string(),
   },
   handler: async (ctx, args) => {
-    const { object } = await generateObject({
+    const { output } = await generateText({
       model: nanoModel,
-      schema: z.object({
-        claims: z.array(z.string()),
-        flags: z.array(
-          z.object({
-            type: z.enum([
-              "vague", "stat", "prediction",
-              "attribution", "logic", "contradiction",
-            ]),
-            label: z.string(),
-          })
-        ),
-        tone: z.string(),
-        confidence: z.number().min(0).max(1),
+      output: Output.object({
+        schema: z.object({
+          claims: z.array(z.string()),
+          flags: z.array(
+            z.object({
+              type: z.enum([
+                "vague", "stat", "prediction",
+                "attribution", "logic", "contradiction",
+              ]),
+              label: z.string(),
+            })
+          ),
+          tone: z.string(),
+          confidence: z.number().min(0).max(1),
+        }),
       }),
       system: `You are a real-time claim analyzer. Given a transcript segment, identify claims, flag issues, assess tone and confidence.`,
       prompt: args.text,
     });
 
+    if (!output) throw new Error("L1 returned no structured output");
+
     await ctx.runMutation(internal.results.writePulse, {
       sessionId: args.sessionId,
       chunkId: args.chunkId,
       chunkIndex: args.chunkIndex,
-      ...object,
+      ...output,
     });
   },
 });
@@ -617,35 +747,38 @@ export const runAnalysis = internalAction({
     });
     const transcript = chunks.map((c) => c.text).join("\n\n");
 
-    // Tavily verification for top claims
     const searchResults = await searchTavily(transcript.slice(0, 500));
 
-    const { object } = await generateObject({
+    const { output } = await generateText({
       model: superModel,
-      schema: z.object({
-        tldr: z.string(),
-        corePoints: z.array(z.string()),
-        underlyingStatement: z.string(),
-        evidenceTable: z.array(
-          z.object({ claim: z.string(), evidence: z.string() })
-        ),
-        appeals: z.object({
-          ethos: z.string(),
-          pathos: z.string(),
-          logos: z.string(),
+      output: Output.object({
+        schema: z.object({
+          tldr: z.string(),
+          corePoints: z.array(z.string()),
+          underlyingStatement: z.string(),
+          evidenceTable: z.array(
+            z.object({ claim: z.string(), evidence: z.string() })
+          ),
+          appeals: z.object({
+            ethos: z.string(),
+            pathos: z.string(),
+            logos: z.string(),
+          }),
+          assumptions: z.array(z.string()),
+          steelman: z.string(),
+          missing: z.array(z.string()),
         }),
-        assumptions: z.array(z.string()),
-        steelman: z.string(),
-        missing: z.array(z.string()),
       }),
       system: `You are a rhetorical analyst. Given transcript segments and search results for verification, produce a structured analysis.`,
       prompt: `Transcript:\n${transcript}\n\nVerification results:\n${JSON.stringify(searchResults)}`,
     });
 
+    if (!output) throw new Error("L2 returned no structured output");
+
     await ctx.runMutation(internal.results.writeAnalysis, {
       sessionId: args.sessionId,
       triggerChunkIndex: args.triggerChunkIndex,
-      ...object,
+      ...output,
     });
   },
 });
@@ -662,29 +795,33 @@ export const runPatterns = internalAction({
     });
     const fullTranscript = chunks.map((c) => c.text).join("\n\n");
 
-    const { object } = await generateObject({
+    const { output } = await generateText({
       model: superModel,
-      schema: z.object({
-        patterns: z.array(
-          z.object({
-            type: z.enum([
-              "escalation", "contradiction",
-              "narrative-arc", "cherry-picking",
-            ]),
-            description: z.string(),
-          })
-        ),
-        trustTrajectory: z.array(z.number()),
-        overallAssessment: z.string(),
+      output: Output.object({
+        schema: z.object({
+          patterns: z.array(
+            z.object({
+              type: z.enum([
+                "escalation", "contradiction",
+                "narrative-arc", "cherry-picking",
+              ]),
+              description: z.string(),
+            })
+          ),
+          trustTrajectory: z.array(z.number()),
+          overallAssessment: z.string(),
+        }),
       }),
       system: `You are a pattern detection system. Given the full transcript, identify cross-claim patterns, contradictions, narrative arcs, and confidence trajectory.`,
       prompt: fullTranscript,
     });
 
+    if (!output) throw new Error("L3 returned no structured output");
+
     await ctx.runMutation(internal.results.writePatterns, {
       sessionId: args.sessionId,
       triggerChunkIndex: args.triggerChunkIndex,
-      ...object,
+      ...output,
     });
   },
 });
@@ -708,7 +845,7 @@ async function searchTavily(query: string) {
 ### Result mutations + queries (convex/results.ts)
 
 ```typescript
-// convex/results.ts
+// convex/results.ts — NO "use node" (queries + mutations only)
 import { v } from "convex/values";
 import {
   internalMutation,
@@ -716,26 +853,37 @@ import {
   query,
 } from "./_generated/server";
 
-// ── Internal writes (called by actions) ───────────────────
+// ── Shared validators (DRY) ──────────────────────────────
+const flagValidator = v.object({
+  type: v.union(
+    v.literal("vague"),
+    v.literal("stat"),
+    v.literal("prediction"),
+    v.literal("attribution"),
+    v.literal("logic"),
+    v.literal("contradiction")
+  ),
+  label: v.string(),
+});
+
+const patternValidator = v.object({
+  type: v.union(
+    v.literal("escalation"),
+    v.literal("contradiction"),
+    v.literal("narrative-arc"),
+    v.literal("cherry-picking")
+  ),
+  description: v.string(),
+});
+
+// ── Internal writes (called by actions via ctx.runMutation) ──
 export const writePulse = internalMutation({
   args: {
     sessionId: v.id("sessions"),
     chunkId: v.id("chunks"),
     chunkIndex: v.number(),
     claims: v.array(v.string()),
-    flags: v.array(
-      v.object({
-        type: v.union(
-          v.literal("vague"),
-          v.literal("stat"),
-          v.literal("prediction"),
-          v.literal("attribution"),
-          v.literal("logic"),
-          v.literal("contradiction")
-        ),
-        label: v.string(),
-      })
-    ),
+    flags: v.array(flagValidator),
     tone: v.string(),
     confidence: v.number(),
   },
@@ -772,17 +920,7 @@ export const writePatterns = internalMutation({
   args: {
     sessionId: v.id("sessions"),
     triggerChunkIndex: v.number(),
-    patterns: v.array(
-      v.object({
-        type: v.union(
-          v.literal("escalation"),
-          v.literal("contradiction"),
-          v.literal("narrative-arc"),
-          v.literal("cherry-picking")
-        ),
-        description: v.string(),
-      })
-    ),
+    patterns: v.array(patternValidator),
     trustTrajectory: v.array(v.number()),
     overallAssessment: v.string(),
   },
@@ -791,7 +929,7 @@ export const writePatterns = internalMutation({
   },
 });
 
-// ── Internal query (used by actions to read chunks) ───────
+// ── Internal query (used by actions via ctx.runQuery) ─────
 export const getChunksForSession = internalQuery({
   args: { sessionId: v.id("sessions") },
   handler: async (ctx, args) => {
@@ -802,9 +940,20 @@ export const getChunksForSession = internalQuery({
   },
 });
 
-// ── Public queries (subscribed to by frontend) ────────────
+// ── Public queries (subscribed to by frontend via useQuery) ──
 export const listPulses = query({
   args: { sessionId: v.id("sessions") },
+  returns: v.array(v.object({
+    _id: v.id("pulseResults"),
+    _creationTime: v.number(),
+    sessionId: v.id("sessions"),
+    chunkId: v.id("chunks"),
+    chunkIndex: v.number(),
+    claims: v.array(v.string()),
+    flags: v.array(flagValidator),
+    tone: v.string(),
+    confidence: v.number(),
+  })),
   handler: async (ctx, args) => {
     return await ctx.db
       .query("pulseResults")
@@ -815,6 +964,26 @@ export const listPulses = query({
 
 export const listAnalyses = query({
   args: { sessionId: v.id("sessions") },
+  returns: v.array(v.object({
+    _id: v.id("analysisResults"),
+    _creationTime: v.number(),
+    sessionId: v.id("sessions"),
+    triggerChunkIndex: v.number(),
+    tldr: v.string(),
+    corePoints: v.array(v.string()),
+    underlyingStatement: v.string(),
+    evidenceTable: v.array(
+      v.object({ claim: v.string(), evidence: v.string() })
+    ),
+    appeals: v.object({
+      ethos: v.string(),
+      pathos: v.string(),
+      logos: v.string(),
+    }),
+    assumptions: v.array(v.string()),
+    steelman: v.string(),
+    missing: v.array(v.string()),
+  })),
   handler: async (ctx, args) => {
     return await ctx.db
       .query("analysisResults")
@@ -825,6 +994,15 @@ export const listAnalyses = query({
 
 export const listPatterns = query({
   args: { sessionId: v.id("sessions") },
+  returns: v.array(v.object({
+    _id: v.id("patternResults"),
+    _creationTime: v.number(),
+    sessionId: v.id("sessions"),
+    triggerChunkIndex: v.number(),
+    patterns: v.array(patternValidator),
+    trustTrajectory: v.array(v.number()),
+    overallAssessment: v.string(),
+  })),
   handler: async (ctx, args) => {
     return await ctx.db
       .query("patternResults")
@@ -843,8 +1021,11 @@ app/
   layout.tsx                -- root layout, wraps <ConvexProvider>
   ConvexClientProvider.tsx  -- "use client" provider with ConvexReactClient
   page.tsx                  -- main layout, two-panel (input | analysis)
+  api/
+    transcribe/
+      route.ts              -- thin proxy: audio blob → NIM ASR gRPC → text
   hooks/
-    useVoiceInput.ts        -- Web Speech API hook with chunking + auto-flush
+    useVoiceInput.ts        -- MediaRecorder + NIM ASR primary, Web Speech fallback
   components/
     TranscriptInput.tsx     -- paste area + live mic toggle, uses useVoiceInput
     PulseFeed.tsx           -- scrolling L1 results (useQuery subscriptions)
@@ -858,6 +1039,8 @@ convex/
   chunks.ts                -- addChunk mutation + listBySession query
   analysis.ts              -- "use node" actions (L1, L2, L3)
   results.ts               -- write mutations + read queries for results
+protos/
+  riva_asr.proto            -- Riva ASR proto definitions (from nvidia-riva/common)
 ```
 
 ### Frontend Wiring (key hooks)
@@ -909,7 +1092,7 @@ Fires on every chunk. Lightweight structured output.
 
 - Triggered by: `ctx.scheduler.runAfter(0, internal.analysis.runPulse, ...)`
 - Model: **Nemotron 3 Nano** (`nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B`) — 3B active params, optimized for speed
-- Method: `generateObject` from Vercel AI SDK with Zod schema
+- Method: `generateText` + `Output.object()` (AI SDK v6) with Zod schema
 - Output: `{ claims[], flags[], tone, confidence }`
 - Persistence: written to `pulseResults` table via `writePulse` mutation
 - Rendering: inline badges below each transcript segment, auto-updated by `useQuery`
@@ -922,7 +1105,7 @@ Fires after every 3rd chunk. Full rhetorical breakdown.
 - Triggered by: `ctx.scheduler.runAfter(0, internal.analysis.runAnalysis, ...)`
 - Model: **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) — reasoning model, tool calling
 - Tool: Tavily search for claim verification (direct `fetch` in action)
-- Method: `generateObject` with full analysis schema
+- Method: `generateText` + `Output.object()` with full analysis schema
 - Output: structured analysis object (tldr, corePoints, evidenceTable, appeals, etc.)
 - Persistence: written to `analysisResults` table via `writeAnalysis` mutation
 - Rendering: expandable panels in Analysis tab, auto-updated by `useQuery`
@@ -934,7 +1117,7 @@ Fires after 6+ chunks, every 3rd chunk. Sends full session transcript.
 - Triggered by: `ctx.scheduler.runAfter(0, internal.analysis.runPatterns, ...)`
 - Model: **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b`) — 1M context window
 - Context: entire accumulated transcript (this is the 1M window play)
-- Method: `generateObject` with patterns schema
+- Method: `generateText` + `Output.object()` with patterns schema
 - Output: patterns array, trust trajectory, overall assessment
 - Persistence: written to `patternResults` table via `writePatterns` mutation
 - Rendering: Patterns tab with trajectory chart, auto-updated by `useQuery`
@@ -999,16 +1182,17 @@ narrative-arc, cherry-picking.
 ### Option A: Live Voice (strongest demo)
 
 1. Click "Start Listening" and begin speaking or play a video/podcast
-2. Transcript appears word-by-word in real-time (interim results from Web Speech API)
-3. Every ~15 seconds, a chunk flushes -- L1 flags appear inline within a second
-4. After 3 chunks (~45 seconds), L2 analysis panel populates with verified claims
-5. After 6 chunks (~90 seconds), L3 patterns tab lights up with trajectory
+2. Every ~10 seconds, an audio chunk is sent to Nemotron ASR for transcription
+3. Transcribed text appears in the transcript panel, L1 flags appear inline within a second
+4. After 3 chunks (~30 seconds), L2 analysis panel populates with verified claims
+5. After 6 chunks (~60 seconds), L3 patterns tab lights up with trajectory
 6. Pitch: "I'm speaking right now and the system is analyzing me in real time.
-   Nemotron Nano fires L1 on every chunk in under a second. Nemotron Super
-   handles deep analysis with its 1M context window -- the entire Nemotron 3
-   family just dropped at GTC this week. Convex handles the real-time sync.
-   No WebSockets, no polling. Every result streams to every connected client
-   the instant it's written to the database."
+   Three Nemotron models running concurrently: Nemotron Speech ASR transcribes
+   my voice, Nemotron Nano flags claims in under a second, and Nemotron Super
+   runs deep analysis with its 1M context window. Three models, three tiers,
+   all from the Nemotron 3 family that launched at GTC this week. Convex
+   handles the real-time sync -- every result streams to every connected
+   client the instant it hits the database. No WebSockets. No polling."
 
 ### Option B: Paste (fallback / faster demo)
 
@@ -1028,22 +1212,98 @@ narrative-arc, cherry-picking.
     "convex": "latest",
     "ai": "latest",
     "@ai-sdk/openai-compatible": "latest",
-    "zod": "latest"
+    "zod": "latest",
+    "@grpc/grpc-js": "latest",
+    "@grpc/proto-loader": "latest"
   }
 }
 ```
 
-Tavily is a simple REST call inside Convex actions. No SDK needed.
+- `@grpc/grpc-js` + `@grpc/proto-loader` -- for NIM ASR gRPC calls in the
+  transcription proxy route. Also need Riva proto files from
+  [nvidia-riva/common](https://github.com/nvidia-riva/common/tree/main/riva/proto).
+- Tavily is a simple REST call inside Convex actions. No SDK needed.
 
 ---
 
 ## Environment Variables
 
+**Convex backend** (set via dashboard or CLI, NOT `.env` files):
+
+```bash
+npx convex env set NEBIUS_API_KEY "your-nebius-key"
+npx convex env set TAVILY_API_KEY "your-tavily-key"
 ```
-NEBIUS_API_KEY=       # Nebius Token Factory (set in Convex dashboard)
-TAVILY_API_KEY=       # Tavily search (set in Convex dashboard)
-NEXT_PUBLIC_CONVEX_URL=  # from npx convex dev
+
+These are accessed as `process.env.NEBIUS_API_KEY` inside `"use node"` actions.
+Convex actions run on Convex Cloud, so local `.env` files don't apply to them.
+
+**Next.js frontend + ASR proxy** (set in `.env.local`):
+
 ```
+NEXT_PUBLIC_CONVEX_URL=  # output from npx convex dev
+NVIDIA_API_KEY=          # NIM Cloud API key from build.nvidia.com (for ASR)
+```
+
+The `NVIDIA_API_KEY` is used by the `/api/transcribe` Next.js route to
+authenticate with the NIM Cloud ASR gRPC endpoint. This key is NOT set in
+Convex because the ASR proxy runs in Next.js, not in a Convex action.
+
+---
+
+## Compatibility Notes
+
+### AI SDK v6 migration
+
+`generateObject` is deprecated as of AI SDK v6. Use `generateText` with
+`Output.object()` instead. The architecture uses the new pattern:
+
+```typescript
+// Old (deprecated)
+const { object } = await generateObject({ model, schema, prompt });
+
+// New (AI SDK v6)
+const { output } = await generateText({
+  model,
+  output: Output.object({ schema }),
+  prompt,
+});
+```
+
+The new API is more flexible -- you can combine structured output with tool
+calling in the same request, which opens up future possibilities for L2
+(e.g., letting the model decide when to call Tavily vs. answer directly).
+
+### Nebius structured output support
+
+Nebius Token Factory supports two JSON modes:
+
+| Mode | `response_format` | Use case |
+|---|---|---|
+| **JSON Schema** | `{ type: "json_schema" }` | Strict schema adherence (what we use) |
+| **JSON Object** | `{ type: "json_object" }` | Arbitrary JSON, model decides structure |
+
+Setting `supportsStructuredOutputs: true` on the provider tells the AI SDK to
+use `json_schema` mode. Nebius also supports `zodResponseFormat` from the
+OpenAI SDK if you drop down to the raw client.
+
+### Nebius function calling
+
+Nebius supports OpenAI-compatible function calling with `tool_choice: "auto"`.
+Both Nemotron Nano and Super support tool use. This means L2 could be enhanced
+to let the model decide when Tavily verification is needed rather than always
+calling it.
+
+### Convex `"use node"` actions
+
+Actions that call external APIs need the `"use node"` directive at the top of
+the file. Key constraints:
+
+- Actions cannot read/write the DB directly -- use `ctx.runQuery` and
+  `ctx.runMutation` to go through query/mutation functions.
+- Actions can `fetch` any external URL.
+- `process.env` reads from Convex dashboard environment variables.
+- Actions have a 10-minute timeout (plenty for LLM calls).
 
 ---
 
@@ -1051,13 +1311,45 @@ NEXT_PUBLIC_CONVEX_URL=  # from npx convex dev
 
 | Concern | Before (v1) | Now (Convex) |
 |---|---|---|
-| API routes | 3 Next.js POST routes | 0 -- Convex mutations/actions replace them |
+| API routes | 3 Next.js POST routes | 1 thin audio proxy (`/api/transcribe`) -- everything else is Convex |
+| Voice input | None | MediaRecorder → Nemotron ASR (NIM Cloud) → text chunks |
 | Real-time updates | Client polling or SSE | Automatic via `useQuery` subscriptions |
 | Orchestration | Manual in route handlers | `ctx.scheduler.runAfter` in mutations |
 | Persistence | None (stateless routes) | Every result stored in Convex DB |
 | External API calls | Next.js server actions | Convex `"use node"` actions with `fetch` |
+| Models | 1 model (Super for everything) | 3 Nemotron models (ASR + Nano + Super) |
 | Type safety | Manual Zod parsing | Schema-validated DB + typed function args |
 | Infrastructure | Vercel serverless | Convex Cloud (backend) + Vercel (frontend) |
-| Streaming LLM output | `streamText` via SSE | `generateObject` → write to DB → reactive query |
+| Streaming LLM output | `streamText` via SSE | `generateText` + `Output.object()` → write to DB → reactive query |
 
-That is the entire stack. Two API keys. Two Nemotron models. Three thinking levels. Zero API routes.
+---
+
+## Convex Best Practices Checklist
+
+Verified against Convex plugin rules and skills:
+
+- [x] **`returns` validators on all public functions** -- `sessions.get`,
+  `chunks.listBySession`, `results.listPulses`, etc. all have `returns` defined
+- [x] **`args` validators on all functions** -- every function uses `v.*` validators
+- [x] **Scheduler uses `internal.*` only** -- `ctx.scheduler.runAfter(0, internal.analysis.runPulse, ...)`
+  never schedules public `api.*` functions
+- [x] **`"use node"` file separation** -- `convex/analysis.ts` has `"use node"` and
+  contains only `internalAction` exports. Queries and mutations live in separate
+  files (`sessions.ts`, `chunks.ts`, `results.ts`)
+- [x] **Actions use `ctx.runMutation` / `ctx.runQuery`** -- never access `ctx.db`
+  directly from actions
+- [x] **Indexed queries** -- all queries use `.withIndex()`, no `.filter()` calls
+- [x] **Flat relational schema** -- no deep nesting, ID references between tables
+- [x] **Small bounded arrays** -- `claims`, `flags`, `patterns` are bounded by
+  the LLM output schema (typically <20 items)
+- [x] **Environment variables via Convex dashboard** -- `process.env.NEBIUS_API_KEY`
+  and `process.env.TAVILY_API_KEY` set via `npx convex env set`, not `.env` files
+- [x] **No `Date.now()` in queries** -- only used in mutations (`sessions.create`,
+  `chunks.addChunk`)
+- [ ] **Authentication** -- skipped for hackathon MVP, add via Convex Auth or
+  Clerk when ready
+- [ ] **Pagination** -- `pulseResults` could grow large for long sessions; add
+  cursor-based pagination post-MVP
+
+That is the entire stack. Three API keys. Three Nemotron models. Three analysis
+tiers. One thin audio proxy route. Everything else is Convex.
