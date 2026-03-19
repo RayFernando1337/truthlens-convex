@@ -4,10 +4,10 @@ overview: "Phased implementation of TruthLens MVP: a real-time claim analysis to
 todos:
   - id: phase1-scaffold
     content: "Phase 1: Scaffold Next.js + Convex, deploy schema, wire provider, set env vars"
-    status: pending
+    status: completed
   - id: phase1-verify
     content: "Phase 1 VERIFY: App loads, Convex dashboard shows 5 tables, no errors"
-    status: pending
+    status: completed
   - id: phase2-sessions-chunks
     content: "Phase 2: Create sessions.ts and chunks.ts with addChunk mutation + scheduler"
     status: pending
